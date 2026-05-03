@@ -9,6 +9,7 @@ import numpy as np
 import mediapipe as mp
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.websockets import WebSocketState
 from PIL import Image
 
 from detection.bicep_curl import BicepCurlDetection
@@ -34,6 +35,9 @@ lunge_detector = LungeDetection()
 print("All ML models loaded ✅")
 
 mp_pose = mp.solutions.pose
+
+# ── Keepalive interval (seconds) ─────────────────────────────────────────
+PING_INTERVAL = 20  # Send keepalive every 20s to prevent proxy timeout
 
 
 # ── Health endpoint ──────────────────────────────────────────────────────
@@ -61,11 +65,31 @@ def encode_frame(image: np.ndarray) -> bytes:
     return buffer.tobytes()
 
 
+async def keepalive_sender(websocket: WebSocket, stop_event: asyncio.Event):
+    """Background task that sends periodic keepalive pings to prevent
+    Render's reverse proxy from closing the WebSocket after idle timeout."""
+    try:
+        while not stop_event.is_set():
+            await asyncio.sleep(PING_INTERVAL)
+            if websocket.client_state == WebSocketState.CONNECTED:
+                try:
+                    await websocket.send_text(json.dumps({"type": "ping"}))
+                except Exception:
+                    break
+            else:
+                break
+    except asyncio.CancelledError:
+        pass
+
+
 # ── WebSocket: Bicep Curl ────────────────────────────────────────────────
 @app.websocket("/ws/live_bicep_curl")
 async def ws_bicep_curl(websocket: WebSocket):
     await websocket.accept()
     print("[WS] Bicep Curl client connected")
+
+    stop_event = asyncio.Event()
+    ping_task = asyncio.create_task(keepalive_sender(websocket, stop_event))
 
     # Each WS connection gets its own detector state
     detector = BicepCurlDetection()
@@ -107,7 +131,6 @@ async def ws_bicep_curl(websocket: WebSocket):
                         "is_correct": not feedback["has_error"],
                     }))
                 else:
-                    # Still draw something so client gets a frame back
                     await websocket.send_text(json.dumps({
                         "feedback": "No pose detected - adjust camera",
                     }))
@@ -121,6 +144,9 @@ async def ws_bicep_curl(websocket: WebSocket):
         except Exception as e:
             print(f"[WS] Bicep Curl error: {e}")
             traceback.print_exc()
+        finally:
+            stop_event.set()
+            ping_task.cancel()
 
 
 # ── WebSocket: Plank ─────────────────────────────────────────────────────
@@ -128,6 +154,9 @@ async def ws_bicep_curl(websocket: WebSocket):
 async def ws_plank(websocket: WebSocket):
     await websocket.accept()
     print("[WS] Plank client connected")
+
+    stop_event = asyncio.Event()
+    ping_task = asyncio.create_task(keepalive_sender(websocket, stop_event))
 
     detector = PlankDetection()
     frame_count = 0
@@ -186,6 +215,9 @@ async def ws_plank(websocket: WebSocket):
         except Exception as e:
             print(f"[WS] Plank error: {e}")
             traceback.print_exc()
+        finally:
+            stop_event.set()
+            ping_task.cancel()
 
 
 # ── WebSocket: Lunge ─────────────────────────────────────────────────────
@@ -193,6 +225,9 @@ async def ws_plank(websocket: WebSocket):
 async def ws_lunge(websocket: WebSocket):
     await websocket.accept()
     print("[WS] Lunge client connected")
+
+    stop_event = asyncio.Event()
+    ping_task = asyncio.create_task(keepalive_sender(websocket, stop_event))
 
     detector = LungeDetection()
     frame_count = 0
@@ -243,6 +278,9 @@ async def ws_lunge(websocket: WebSocket):
         except Exception as e:
             print(f"[WS] Lunge error: {e}")
             traceback.print_exc()
+        finally:
+            stop_event.set()
+            ping_task.cancel()
 
 
 # ── Run ──────────────────────────────────────────────────────────────────
